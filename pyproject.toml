@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memoryloom"
+dynamic = ["version"]
+description = "MemoryLoom — evidence-grounded, outcome-aware user memory service for AI applications"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "97Three" }]
+keywords = ["ai", "memory", "agent", "retrieval", "personalization"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "alembic>=1.15,<2",
+    "fastapi>=0.115,<1",
+    "pymilvus>=2.6.12,<2.7",
+    "psycopg[binary,pool]>=3.2,<4",
+    "pydantic>=2.10,<3",
+    "pyjwt[crypto]>=2.10,<3",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<1",
+    "httpx2>=2.7,<3",
+    "mypy>=1.15,<2",
+    "playwright>=1.52,<2",
+    "pytest>=8.3,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.11,<1",
+]
+
+[project.scripts]
+memoryloom = "memoryloom.main:run"
+memoryloom-eval = "memoryloom.evaluation.cli:run"
+memoryloom-frontend = "memoryloom.frontend:run"
+memoryloom-migrate = "memoryloom.migrate:run"
+memoryloom-projector = "memoryloom.projector:run"
+
+[tool.hatch.version]
+path = "src/memoryloom/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memoryloom"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers --cov=memoryloom --cov-report=term-missing"
+testpaths = ["tests"]
+markers = [
+    "browser: Playwright browser E2E tests (skip safely when Chromium is unavailable)",
+    "postgres: integration tests requiring MEMORYLOOM_TEST_DATABASE_URL",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["memoryloom"]
+omit = [
+    "src/memoryloom/adapters/postgres.py",
+    "src/memoryloom/adapters/postgres_governance.py",
+    "src/memoryloom/adapters/projection_outbox.py",
+    "src/memoryloom/migrate.py",
+    "src/memoryloom/migrations/*",
+    "src/memoryloom/projector.py",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["memoryloom"]
+
+[tool.ruff.lint.per-file-ignores]
+# Demo fixtures quote natural Chinese user speech, where full-width punctuation is
+# intentional and must not be normalised to ASCII.
+"examples/*.py" = ["RUF001"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["memoryloom"]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "uvicorn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pymilvus.*"
+ignore_missing_imports = true
