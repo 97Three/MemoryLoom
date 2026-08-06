@@ -1,0 +1,718 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
+
+from memoryloom.application.commands import (
+    MemoryUsageResult,
+    OutcomeResult,
+    PreferenceResult,
+)
+from memoryloom.domain.experience import OutcomeKind, RecallTrace, UtilityEstimate
+from memoryloom.domain.governance import (
+    ErasureRequest,
+    ProcessingGrant,
+    SuppressionFence,
+)
+from memoryloom.domain.memory import MemoryRevision, MemorySnapshot
+from memoryloom.domain.projection import (
+    ContextCompressionAlgorithm,
+    RecallContextProjection,
+)
+
+Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+OutcomeWeight = Annotated[float, Field(gt=0.0, le=10.0)]
+
+MAX_SCOPE_ID_LENGTH = 128
+MAX_SOURCE_LENGTH = 128
+MAX_IDEMPOTENCY_KEY_LENGTH = 256
+MAX_MEMORY_KEY_LENGTH = 256
+MAX_MEMORY_VALUE_LENGTH = 4_096
+MAX_EVIDENCE_TEXT_LENGTH = 16_384
+MAX_CONTEXT_FACETS = 32
+MAX_CONTEXT_KEY_LENGTH = 128
+MAX_CONTEXT_VALUE_LENGTH = 512
+MAX_REASON_LENGTH = 2_048
+MAX_QUERY_LENGTH = 4_096
+MAX_NOTE_LENGTH = 4_096
+MAX_PURPOSE_LENGTH = 128
+MAX_POLICY_CODE_LENGTH = 128
+
+ScopeId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_SCOPE_ID_LENGTH),
+]
+SourceText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_SOURCE_LENGTH),
+]
+IdempotencyKey = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_IDEMPOTENCY_KEY_LENGTH,
+    ),
+]
+MemoryKey = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MEMORY_KEY_LENGTH),
+]
+MemoryValue = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MEMORY_VALUE_LENGTH),
+]
+EvidenceText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_EVIDENCE_TEXT_LENGTH),
+]
+ContextKey = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_CONTEXT_KEY_LENGTH),
+]
+ContextValue = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_CONTEXT_VALUE_LENGTH),
+]
+ContextMap = Annotated[dict[ContextKey, ContextValue], Field(max_length=MAX_CONTEXT_FACETS)]
+ReasonText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_REASON_LENGTH),
+]
+QueryText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_QUERY_LENGTH),
+]
+NoteText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=MAX_NOTE_LENGTH),
+]
+PurposeText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_PURPOSE_LENGTH),
+]
+PolicyCode = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_POLICY_CODE_LENGTH),
+]
+Sha256Digest = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, pattern=r"^[0-9A-Fa-f]{64}$"),
+]
+
+
+class ApiModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class PreferenceWriteRequest(ApiModel):
+    tenant_id: ScopeId = Field(description="开发环境租户作用域。")
+    subject_id: ScopeId = Field(description="租户内的用户或主体标识。")
+    source: SourceText = Field(description="证据来源, 例如 conversation。")
+    idempotency_key: IdempotencyKey = Field(
+        description="作用域内唯一的幂等键; 重试必须复用, 新的事实必须更换。",
+    )
+    key: MemoryKey = Field(description="稳定的记忆键, 建议使用点分命名。")
+    value: MemoryValue = Field(description="根据证据得出的当前偏好值。")
+    context: ContextMap = Field(
+        default_factory=dict,
+        description="偏好成立的上下文维度; 键和值都参与匹配。",
+    )
+    evidence_text: EvidenceText = Field(description="用户或来源的原始证据文本。")
+    confidence: Confidence = 0.80
+    purpose: PurposeText = Field(
+        default="personalization",
+        description="受控处理目的。生产授权必须显式允许该目的。",
+    )
+    occurred_at: AwareDatetime | None = Field(
+        default=None,
+        description="证据实际发生时间; 省略时使用服务端当前 UTC 时间。",
+    )
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "source": "conversation",
+                "idempotency_key": "turn-42:preference-1",
+                "key": "drink.preference",
+                "value": "decaf coffee",
+                "context": {"time_of_day": "evening"},
+                "evidence_text": "晚上我只喝低因咖啡",
+                "confidence": 0.92,
+            }
+        },
+    )
+
+
+class PreferenceCorrectionRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    source: SourceText
+    idempotency_key: IdempotencyKey
+    value: MemoryValue
+    evidence_text: EvidenceText
+    reason: ReasonText
+    purpose: PurposeText = "personalization"
+    occurred_at: AwareDatetime | None = None
+    expected_revision_id: UUID | None = Field(
+        default=None,
+        description="可选的乐观并发条件; 当前修订不匹配时返回 409。",
+    )
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "source": "explicit-feedback",
+                "idempotency_key": "turn-43:correction-1",
+                "value": "herbal tea",
+                "evidence_text": "其实晚上我改喝花草茶",
+                "reason": "user corrected an outdated preference",
+            }
+        },
+    )
+
+
+class PreferenceResponse(ApiModel):
+    observation_id: UUID
+    candidate_id: UUID
+    record_id: UUID
+    revision_id: UUID
+    sequence: int
+    idempotent_replay: bool
+
+    @classmethod
+    def from_result(cls, result: PreferenceResult) -> PreferenceResponse:
+        return cls(
+            observation_id=result.observation_id,
+            candidate_id=result.candidate_id,
+            record_id=result.record_id,
+            revision_id=result.revision_id,
+            sequence=result.sequence,
+            idempotent_replay=result.idempotent_replay,
+        )
+
+
+class PreferenceSummaryResponse(ApiModel):
+    record_id: UUID
+    revision_id: UUID
+    sequence: int
+    key: str
+    value: str
+    context: dict[str, str]
+    confidence: float
+    support_count: int
+    evidence_count: int
+    valid_from: datetime
+    recorded_at: datetime
+
+    @classmethod
+    def from_snapshot(cls, snapshot: MemorySnapshot) -> PreferenceSummaryResponse:
+        return cls(
+            record_id=snapshot.record.id,
+            revision_id=snapshot.revision.id,
+            sequence=snapshot.revision.sequence,
+            key=snapshot.record.key,
+            value=snapshot.revision.value,
+            context=snapshot.record.context.as_dict(),
+            confidence=snapshot.revision.belief.confidence,
+            support_count=snapshot.revision.belief.support_count,
+            evidence_count=len(snapshot.revision.evidence_ids),
+            valid_from=snapshot.revision.valid_from,
+            recorded_at=snapshot.revision.recorded_at,
+        )
+
+
+class RecallRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    query: QueryText
+    context: ContextMap = Field(default_factory=dict)
+    limit: int = Field(default=10, ge=1, le=100)
+    valid_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "可选业务有效时点。只考虑 valid_from 不晚于该时点的修订。"
+            "省略时使用本次请求的服务端 UTC 时间。"
+        ),
+    )
+    known_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "可选系统知识截止时点。只使用不晚于该时点记录的修订与 Outcome。"
+            "不能晚于本次请求的服务端时间。省略时使用服务端 UTC 时间。"
+        ),
+    )
+    purpose: PurposeText = "personalization"
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "query": "晚上应该准备什么饮料",
+                "context": {"time_of_day": "evening"},
+                "limit": 5,
+            }
+        },
+    )
+
+
+class ScoreResponse(ApiModel):
+    semantic: float
+    context: float
+    belief: float
+    utility: float
+    recency: float
+    lexical: float | None = None
+    vector: float | None = None
+
+
+class RecallItemResponse(ApiModel):
+    record_id: UUID
+    revision_id: UUID
+    key: str
+    value: str
+    context: dict[str, str]
+    revision_valid_from: datetime
+    revision_recorded_at: datetime
+    rank: int
+    score: float
+    breakdown: ScoreResponse
+    evidence_ids: list[UUID]
+
+
+class RecallResponse(ApiModel):
+    trace_id: UUID
+    policy_id: UUID
+    policy_version: int
+    valid_at: datetime
+    known_at: datetime
+    created_at: datetime
+    items: list[RecallItemResponse]
+
+    @classmethod
+    def from_trace(cls, trace: RecallTrace) -> RecallResponse:
+        return cls(
+            trace_id=trace.id,
+            policy_id=trace.policy_id,
+            policy_version=trace.policy_version,
+            valid_at=trace.valid_at,
+            known_at=trace.known_at,
+            created_at=trace.created_at,
+            items=[
+                RecallItemResponse(
+                    record_id=item.record_id,
+                    revision_id=item.revision_id,
+                    key=item.key,
+                    value=item.value,
+                    context=item.context.as_dict(),
+                    revision_valid_from=item.revision_valid_from,
+                    revision_recorded_at=item.revision_recorded_at,
+                    rank=item.rank,
+                    score=item.score,
+                    breakdown=ScoreResponse(
+                        semantic=item.breakdown.semantic,
+                        context=item.breakdown.context,
+                        belief=item.breakdown.belief,
+                        utility=item.breakdown.utility,
+                        recency=item.breakdown.recency,
+                        lexical=item.breakdown.lexical,
+                        vector=item.breakdown.vector,
+                    ),
+                    evidence_ids=list(item.evidence_ids),
+                )
+                for item in trace.items
+            ],
+        )
+
+
+class RecallContextProjectionRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm = ContextCompressionAlgorithm.RANKED_EXTRACTIVE
+    max_characters: int = Field(default=2_000, ge=64, le=100_000)
+    purpose: PurposeText = "personalization"
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "trace_id": "00000000-0000-0000-0000-000000000101",
+                "algorithm": "ranked-extractive-v1",
+                "max_characters": 2000,
+            }
+        },
+    )
+
+
+class ContextProjectionSourceResponse(ApiModel):
+    record_id: UUID
+    revision_id: UUID
+    rank: int
+    score: float
+
+
+class ContextProjectionSegmentResponse(ApiModel):
+    content: str
+    sources: list[ContextProjectionSourceResponse]
+
+
+class RecallContextProjectionResponse(ApiModel):
+    trace_id: UUID
+    policy_id: UUID
+    policy_version: int
+    algorithm: ContextCompressionAlgorithm
+    algorithm_version: int
+    max_characters: int
+    valid_at: datetime
+    known_at: datetime
+    trace_created_at: datetime
+    content: str
+    segments: list[ContextProjectionSegmentResponse]
+    source_revision_ids: list[UUID]
+    source_item_count: int
+    included_item_count: int
+    omitted_item_count: int
+    original_character_count: int
+    projected_character_count: int
+    compression_ratio: float
+    configuration_sha256: str
+    source_sha256: str
+    projection_sha256: str
+
+    @classmethod
+    def from_projection(
+        cls,
+        projection: RecallContextProjection,
+    ) -> RecallContextProjectionResponse:
+        return cls(
+            trace_id=projection.trace_id,
+            policy_id=projection.policy_id,
+            policy_version=projection.policy_version,
+            algorithm=projection.algorithm,
+            algorithm_version=projection.algorithm.version,
+            max_characters=projection.budget_characters,
+            valid_at=projection.valid_at,
+            known_at=projection.known_at,
+            trace_created_at=projection.trace_created_at,
+            content=projection.content,
+            segments=[
+                ContextProjectionSegmentResponse(
+                    content=segment.content,
+                    sources=[
+                        ContextProjectionSourceResponse(
+                            record_id=source.record_id,
+                            revision_id=source.revision_id,
+                            rank=source.rank,
+                            score=source.score,
+                        )
+                        for source in segment.sources
+                    ],
+                )
+                for segment in projection.segments
+            ],
+            source_revision_ids=list(projection.source_revision_ids),
+            source_item_count=projection.source_item_count,
+            included_item_count=projection.included_item_count,
+            omitted_item_count=projection.omitted_item_count,
+            original_character_count=projection.original_character_count,
+            projected_character_count=len(projection.content),
+            compression_ratio=projection.compression_ratio,
+            configuration_sha256=projection.configuration_sha256,
+            source_sha256=projection.source_sha256,
+            projection_sha256=projection.projection_sha256,
+        )
+
+
+class MemoryUsageWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm
+    max_characters: int = Field(ge=64, le=100_000)
+    source_projection_sha256: Sha256Digest
+    delivered_context_sha256: Sha256Digest
+    revision_ids: list[UUID] = Field(min_length=1, max_length=100)
+    idempotency_key: IdempotencyKey
+    occurred_at: AwareDatetime | None = None
+    purpose: PurposeText = "personalization"
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "trace_id": "00000000-0000-0000-0000-000000000101",
+                "algorithm": "exact-deduplicated-v1",
+                "max_characters": 2000,
+                "source_projection_sha256": "a" * 64,
+                "delivered_context_sha256": "b" * 64,
+                "revision_ids": ["00000000-0000-0000-0000-000000000102"],
+                "idempotency_key": "task-9:memory-usage",
+            }
+        },
+    )
+
+
+class MemoryUsageResponse(ApiModel):
+    usage_id: UUID
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm
+    max_characters: int
+    source_projection_sha256: str
+    delivered_context_sha256: str
+    revision_ids: list[UUID]
+    occurred_at: datetime
+    recorded_at: datetime
+    idempotent_replay: bool
+
+    @classmethod
+    def from_result(cls, result: MemoryUsageResult) -> MemoryUsageResponse:
+        return cls(
+            usage_id=result.usage.id,
+            trace_id=result.usage.trace_id,
+            algorithm=result.usage.algorithm,
+            max_characters=result.usage.budget_characters,
+            source_projection_sha256=result.usage.source_projection_sha256,
+            delivered_context_sha256=result.usage.delivered_context_sha256,
+            revision_ids=list(result.usage.revision_ids),
+            occurred_at=result.usage.occurred_at,
+            recorded_at=result.usage.recorded_at,
+            idempotent_replay=result.idempotent_replay,
+        )
+
+
+class OutcomeWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    trace_id: UUID
+    revision_id: UUID
+    usage_id: UUID | None = None
+    kind: OutcomeKind
+    idempotency_key: IdempotencyKey
+    occurred_at: AwareDatetime | None = None
+    weight: OutcomeWeight = 1.0
+    note: NoteText | None = None
+    purpose: PurposeText = "personalization"
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "trace_id": "00000000-0000-0000-0000-000000000101",
+                "revision_id": "00000000-0000-0000-0000-000000000102",
+                "kind": "helpful",
+                "idempotency_key": "task-9:outcome-1",
+                "weight": 1.0,
+                "note": "The recommendation was accepted.",
+            }
+        },
+    )
+
+
+class UtilityResponse(ApiModel):
+    revision_id: UUID
+    context_fingerprint: str
+    mean: float
+    sample_weight: float
+    positive_weight: float
+    negative_weight: float
+    last_outcome_at: datetime | None
+
+    @classmethod
+    def from_estimate(cls, estimate: UtilityEstimate) -> UtilityResponse:
+        return cls(
+            revision_id=estimate.revision_id,
+            context_fingerprint=estimate.context_fingerprint,
+            mean=estimate.mean,
+            sample_weight=estimate.sample_weight,
+            positive_weight=estimate.positive_weight,
+            negative_weight=estimate.negative_weight,
+            last_outcome_at=estimate.last_outcome_at,
+        )
+
+
+class OutcomeResponse(ApiModel):
+    outcome_id: UUID
+    idempotent_replay: bool
+    utility: UtilityResponse
+
+    @classmethod
+    def from_result(cls, result: OutcomeResult) -> OutcomeResponse:
+        return cls(
+            outcome_id=result.outcome.id,
+            idempotent_replay=result.idempotent_replay,
+            utility=UtilityResponse.from_estimate(result.utility),
+        )
+
+
+class RevisionResponse(ApiModel):
+    id: UUID
+    sequence: int
+    value: str
+    confidence: float
+    support_count: int
+    contradiction_count: int
+    evidence_ids: list[UUID]
+    valid_from: datetime
+    recorded_at: datetime
+    supersedes_revision_id: UUID | None
+
+    @classmethod
+    def from_revision(cls, revision: MemoryRevision) -> RevisionResponse:
+        return cls(
+            id=revision.id,
+            sequence=revision.sequence,
+            value=revision.value,
+            confidence=revision.belief.confidence,
+            support_count=revision.belief.support_count,
+            contradiction_count=revision.belief.contradiction_count,
+            evidence_ids=list(revision.evidence_ids),
+            valid_from=revision.valid_from,
+            recorded_at=revision.recorded_at,
+            supersedes_revision_id=revision.supersedes_revision_id,
+        )
+
+
+class ProcessingGrantWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    purposes: list[PurposeText] = Field(min_length=1, max_length=16)
+    lawful_basis: PolicyCode
+    idempotency_key: IdempotencyKey
+    valid_from: AwareDatetime
+    valid_until: AwareDatetime | None = None
+    purpose: PurposeText = "privacy-governance"
+
+
+class ProcessingGrantResponse(ApiModel):
+    grant_id: UUID
+    purposes: list[str]
+    lawful_basis: str
+    policy_version: str
+    valid_from: datetime
+    valid_until: datetime | None
+    created_at: datetime
+    revoked_at: datetime | None
+
+    @classmethod
+    def from_grant(cls, grant: ProcessingGrant) -> ProcessingGrantResponse:
+        return cls(
+            grant_id=grant.id,
+            purposes=list(grant.purposes),
+            lawful_basis=grant.lawful_basis,
+            policy_version=grant.policy_version,
+            valid_from=grant.valid_from,
+            valid_until=grant.valid_until,
+            created_at=grant.created_at,
+            revoked_at=grant.revoked_at,
+        )
+
+
+class ProcessingGrantRevocationRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    purpose: PurposeText = "privacy-governance"
+
+
+class SuppressionRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    reason_code: PolicyCode
+    idempotency_key: IdempotencyKey
+    purpose: PurposeText = "privacy-governance"
+
+
+class SuppressionResponse(ApiModel):
+    fence_id: UUID
+    reason_code: str
+    policy_version: str
+    created_at: datetime
+
+    @classmethod
+    def from_fence(cls, fence: SuppressionFence) -> SuppressionResponse:
+        return cls(
+            fence_id=fence.id,
+            reason_code=fence.reason_code,
+            policy_version=fence.policy_version,
+            created_at=fence.created_at,
+        )
+
+
+class ErasureWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    reason_code: PolicyCode
+    idempotency_key: IdempotencyKey
+    purpose: PurposeText = "privacy-governance"
+
+
+class ErasureResponse(ApiModel):
+    request_id: UUID
+    scope_digest: str
+    policy_version: str
+    reason_code: str
+    status: str
+    created_at: datetime
+    completed_at: datetime | None
+    summary: dict[str, int] | None
+    handler_results: dict[str, str]
+    error_code: str | None
+
+    @classmethod
+    def from_request(cls, request: ErasureRequest) -> ErasureResponse:
+        return cls(
+            request_id=request.id,
+            scope_digest=request.scope_digest,
+            policy_version=request.policy_version,
+            reason_code=request.reason_code,
+            status=request.status.value,
+            created_at=request.created_at,
+            completed_at=request.completed_at,
+            summary=request.summary.as_dict() if request.summary is not None else None,
+            handler_results=dict(request.handler_results),
+            error_code=request.error_code,
+        )
+
+
+class ErrorResponse(ApiModel):
+    error: str
+    detail: str
+    request_id: str | None = None
+
+
+class ReadinessResponse(ApiModel):
+    status: Literal["ready", "not_ready"]
+    storage: str
+
+
+class ServiceInfoResponse(ApiModel):
+    name: str
+    version: str
+    api_contract: str
+    capabilities: tuple[str, ...]
+    status: str
+    storage: str
+    auth_mode: str
+    scope_source: str
+    frontend_url: str
+    documentation_url: str
+    production_ready: bool
+    production_blockers: tuple[str, ...]
+    notice: str
