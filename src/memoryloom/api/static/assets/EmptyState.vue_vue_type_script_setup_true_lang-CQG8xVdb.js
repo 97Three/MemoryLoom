@@ -1,0 +1,1 @@
+import{d as n,c,a as t,r as s,t as a,o as l}from"./index-ejKK-4rX.js";const i={class:"empty"},r={class:"empty-ico"},d=n({__name:"EmptyState",props:{title:{},copy:{}},setup(e){return(o,p)=>(l(),c("div",i,[t("div",r,[s(o.$slots,"icon")]),t("h3",null,a(e.title),1),t("p",null,a(e.copy),1),s(o.$slots,"action")]))}});export{d as _};
