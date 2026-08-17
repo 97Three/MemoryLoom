@@ -1,0 +1,34 @@
+// Design tokens — white canvas, blue brand, three shadow tiers.
+// Gradient is reserved for four places: primary button, the single hero metric,
+// the brand mark, and data fills. Anywhere else it cheapens the surface.
+:root {
+  --ink: #0a1b2e;
+  --ink2: #425466;
+  --ink3: #6b7c93;
+  --ink4: #8798a8;
+
+  --bg: #f6f8fc;
+  --card: #ffffff;
+  --line: #e6ecf3;
+  --line2: #eef2f7;
+
+  --brand: #3659e3;
+  --brand2: #6c8cff;
+  --brand-soft: #eef2ff;
+
+  --green: #12b76a;
+  --red: #f04438;
+  --amber: #f79009;
+
+  --sh-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --sh: 0 1px 2px rgba(50, 50, 93, 0.06), 0 6px 16px -6px rgba(50, 50, 93, 0.12);
+  --sh-lg: 0 2px 6px rgba(50, 50, 93, 0.08), 0 18px 40px -12px rgba(54, 89, 227, 0.22);
+
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r: 10px;
+  --r-lg: 16px;
+
+  --nav-h: 64px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
