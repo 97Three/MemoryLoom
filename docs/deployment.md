@@ -1,0 +1,287 @@
+# 部署与运行指南
+
+本指南覆盖本机开发、Docker Compose 评估和未来生产部署前的检查项。
+
+> 当前 `0.1.x` 已提供 PostgreSQL 权威存储、Milvus 可重建投影，以及 JWT 身份和 application 授权基线；请求中的 Scope 在 JWT 模式下只是目标选择器，必须由可信 grant 覆盖。项目仍缺完整权限治理、隐私治理和生产运维基线。以下容器配置用于本机演示和集成验证，不是生产部署模板。不要暴露到公网或写入真实敏感数据。
+
+## 选择运行方式
+
+| 方式 | 适合场景 | 数据持久化 |
+| --- | --- | --- |
+| `uv` 双进程 | 日常开发、调试和运行测试 | 后端重启即清空 |
+| 默认 Docker Compose | 新人快速体验、PostgreSQL 集成验证 | 保存在命名 volume |
+| 内存模式 Compose | 快速临时测试 | 后端重启即清空 |
+| 单独 Docker 容器 | 镜像和入口检查 | 容器或进程重启即清空 |
+| 生产部署 | 当前不支持 | JWT 基线已具备，仍缺权限治理/RLS、隐私治理与运维基线 |
+
+## 使用 Docker Compose
+
+### 1. 前置条件
+
+- Docker Engine；
+- Docker Compose v2（使用 `docker compose` 命令）；
+- 本机端口 `33009`、`38089`、`19530` 和 `19091` 未被占用。
+
+如果已经用 `uv` 启动了两个服务，请先在对应终端按 `Ctrl+C`，避免端口冲突。
+
+### 2. 校验并启动
+
+```bash
+docker compose config --quiet
+docker compose up --build -d
+```
+
+Compose 会按依赖关系启动：
+
+- `postgres`：仅位于 Compose 内部网络，数据保存在命名 volume；
+- `etcd`、`minio`、`milvus`：Milvus 2.6 standalone 依赖与向量投影存储；
+- `migrate`：等待数据库健康后执行一次 `memoryloom-migrate`；
+- `projector`：租约消费 Revision outbox，生成 embedding 并幂等写入 Milvus；
+- `backend`：迁移和 Milvus 健康后，以 PostgreSQL 权威存储和可降级混合召回启动 FastAPI；
+- `frontend`：后端健康后启动静态工作台。
+
+应用镜像中的迁移、后端和前端进程都以非 root、只读根文件系统运行。宿主入口为：
+
+- `backend`：FastAPI，发布到 <http://127.0.0.1:38089>；
+- `frontend`：静态工作台，发布到 <http://127.0.0.1:33009>。
+- `milvus`：SDK 发布到 `127.0.0.1:19530`，健康端点发布到 `127.0.0.1:19091`。
+
+前端服务从 `MEMORYLOOM_PUBLIC_API_URL` 动态下发浏览器 API 地址，默认连接 `http://127.0.0.1:38089`。这套 Compose 配置仍只面向本机体验；域名部署必须为前后端进程设置相同的浏览器可达 API 地址，并完成 TLS、反向代理和 CORS 配置。
+
+### 3. 检查状态
+
+```bash
+docker compose ps
+curl http://127.0.0.1:38089/health
+curl http://127.0.0.1:38089/readyz
+curl -I http://127.0.0.1:33009/
+```
+
+健康接口会说明当前存储，依赖就绪接口会真实检查存储连接：
+
+```json
+{"status":"ok","version":"0.1.0","storage":"postgres","auth_mode":"development","scope_source":"request","projection":"enabled"}
+{"status":"ready","storage":"postgres"}
+```
+
+然后打开：
+
+- 工作台：<http://127.0.0.1:33009>
+- OpenAPI：<http://127.0.0.1:38089/docs>
+
+### 4. 查看日志
+
+```bash
+docker compose logs -f postgres milvus migrate projector backend frontend
+```
+
+不要把真实原始证据复制到 Issue 或公开日志。应用访问日志只记录 request ID、方法、路由模板、状态、耗时和字节数，不记录 body 或 query string；项目后端入口也关闭了 Uvicorn 默认的 request-line 日志。反向代理、Ingress、自定义进程管理器、调试中间件和调用方必须遵守同一规则，不要重新记录完整 URL、query 或正文。
+
+### 5. 停止
+
+```bash
+docker compose down
+```
+
+普通 `docker compose down` 会停止并删除容器和网络，但保留 PostgreSQL、Milvus、etcd 和 MinIO 命名 volume；再次启动后权威记忆与投影仍在。只有确认不再需要本机演示数据时才执行：
+
+```bash
+docker compose down --volumes
+```
+
+该命令会永久删除 Compose 中的 PostgreSQL 权威数据和全部 Milvus 投影数据。
+
+### 使用显式内存模式
+
+如果只想运行可随时丢弃的临时环境：
+
+```bash
+docker compose -f compose.memory.yaml up --build -d
+```
+
+内存模式和默认模式使用相同的宿主端口，不能同时运行；切换前先停止当前模式。内存模式只启动后端和前端，并设置 `MEMORYLOOM_STORE=memory`。后端容器重启或重新创建后数据清空。停止命令必须使用相同的 `-f` 参数：
+
+```bash
+docker compose -f compose.memory.yaml down
+```
+
+## 单独构建与运行镜像
+
+构建：
+
+```bash
+docker build -t memoryloom:local .
+```
+
+启动后端：
+
+```bash
+docker run --rm --name memoryloom-backend \
+  -e MEMORYLOOM_HOST=0.0.0.0 \
+  -e MEMORYLOOM_PORT=38089 \
+  -e MEMORYLOOM_STORE=memory \
+  -p 127.0.0.1:38089:38089 \
+  memoryloom:local
+```
+
+在另一终端启动前端：
+
+```bash
+docker run --rm --name memoryloom-frontend \
+  -e MEMORYLOOM_FRONTEND_HOST=0.0.0.0 \
+  -e MEMORYLOOM_FRONTEND_PORT=33009 \
+  -e MEMORYLOOM_PUBLIC_API_URL=http://127.0.0.1:38089 \
+  -p 127.0.0.1:33009:33009 \
+  memoryloom:local \
+  memoryloom-frontend
+```
+
+镜像默认以固定的非 root UID/GID `10001` 运行。Compose 另外移除 Linux capabilities、启用 `no-new-privileges`，并把根文件系统设为只读。
+
+## 环境变量
+
+| 变量 | 容器值 | 说明 |
+| --- | --- | --- |
+| `MEMORYLOOM_ENVIRONMENT` | `development` | `development`、`test`、`staging` 或 `production` |
+| `MEMORYLOOM_HOST` | `0.0.0.0` | 仅在容器内监听；宿主仍绑定到 `127.0.0.1` |
+| `MEMORYLOOM_PORT` | `38089` | 后端容器端口 |
+| `MEMORYLOOM_LOG_LEVEL` | `INFO` | Uvicorn 日志等级 |
+| `MEMORYLOOM_STORE` | `postgres` | 默认 Compose 使用 PostgreSQL；也支持显式 `memory` |
+| `MEMORYLOOM_DATABASE_URL` | Compose 内部 URL | PostgreSQL 连接串；`MEMORYLOOM_STORE=postgres` 时必填 |
+| `MEMORYLOOM_DATABASE_POOL_MIN_SIZE` | `1` | 最小连接池大小 |
+| `MEMORYLOOM_DATABASE_POOL_MAX_SIZE` | `10` | 最大连接池大小 |
+| `MEMORYLOOM_DATABASE_READINESS_TIMEOUT_SECONDS` | `1.0` | `/readyz` 专用连接池等待上限，范围 0.05–30 秒 |
+| `MEMORYLOOM_PROJECTION_MODE` | `milvus` | 默认 Compose 启用 Milvus；内存 Compose 显式禁用 |
+| `MEMORYLOOM_PROJECTION_REQUIRED` | `false` | 为 false 时 Milvus 故障降级到词法召回，不影响 PostgreSQL readiness |
+| `MEMORYLOOM_MILVUS_URI` | `http://milvus:19530` | Compose 网络中的 Milvus 地址 |
+| `MEMORYLOOM_MILVUS_COLLECTION` | `memoryloom_v1` | 可重建 collection 名称 |
+| `MEMORYLOOM_EMBEDDING_PROVIDER` | `hash` | 默认离线确定性基线；也支持 `openai_compatible` |
+| `MEMORYLOOM_EMBEDDING_DIMENSIONS` | `384` | collection 向量维度 |
+| `MEMORYLOOM_MAX_REQUEST_BODY_BYTES` | `1048576` | 应用层请求体上限；同时检查声明长度和实际流量 |
+| `MEMORYLOOM_AUTH_MODE` | `development` | Compose 本机身份；生产必须改为 `jwt` |
+| `MEMORYLOOM_AUTH_JWT_ISSUER` | 空 | JWT issuer；`jwt` 模式必填 |
+| `MEMORYLOOM_AUTH_JWT_AUDIENCE` | 空 | API audience；`jwt` 模式必填 |
+| `MEMORYLOOM_AUTH_JWT_JWKS_URL` | 空 | IdP JWKS URL；`jwt` 模式必填 |
+| `MEMORYLOOM_AUTH_JWT_ALGORITHMS` | `RS256` | 逗号分隔的非对称签名算法 |
+| `MEMORYLOOM_AUTH_REQUIRED_SCOPE` | `memory` | token 必须包含的 OAuth scope |
+| `MEMORYLOOM_AUTH_AUDIT_HMAC_KEY` | 空 | 授权审计引用密钥；`jwt` 模式至少 32 字符 |
+| `MEMORYLOOM_AUTH_AUDIT_SINK` | `log` | `log` 仅开发；生产必须为 `postgres` |
+| `MEMORYLOOM_GOVERNANCE_MODE` | `development` | 开发旁路或 PostgreSQL 强制处理依据/抑制门禁 |
+| `MEMORYLOOM_GOVERNANCE_HMAC_KEY` | 空 | 治理 Scope/主体伪名密钥；PostgreSQL 模式至少 32 字符 |
+| `MEMORYLOOM_GOVERNANCE_PSEUDONYM_KEY_ID` | `governance-v1` | 伪名密钥版本标识 |
+| `MEMORYLOOM_PRIVACY_POLICY_VERSION` | `privacy-v1` | grant、抑制和删除证明绑定的固定策略版本 |
+| `MEMORYLOOM_FRONTEND_URL` | `http://127.0.0.1:33009` | 服务发现返回的前端入口 |
+| `MEMORYLOOM_PUBLIC_API_URL` | `http://127.0.0.1:38089` | 服务发现、前端请求和前端 CSP 共用的浏览器可达 API 基础地址 |
+| `MEMORYLOOM_CORS_ORIGINS` | 两个本机前端 Origin | 逗号分隔的精确允许来源 |
+| `MEMORYLOOM_FRONTEND_HOST` | `0.0.0.0` | 前端容器监听地址 |
+| `MEMORYLOOM_FRONTEND_PORT` | `33009` | 前端容器端口 |
+
+应用不会自动加载 `.env`。Compose 已显式声明所需变量；原生运行时可参考项目根目录 `.env.example` 手动导出。
+
+生产反向代理也应配置请求体上限，且不得高于业务明确允许的值。应用层限制仍需保留，因为 `Content-Length` 可以缺失或不可信；代理限制不能替代服务对实际 ASGI 请求流的累计检查。
+
+## 生产身份与授权
+
+默认 Compose 显式使用 `MEMORYLOOM_AUTH_MODE=development`，只适合本机体验。设置
+开发身份只允许 `MEMORYLOOM_ENVIRONMENT=development` 或 `test`。其他环境如果仍使用开发身份，后端会拒绝启动；未知环境名称同样拒绝启动，避免拼写错误绕过生产门禁。
+
+JWT 模式最小配置：
+
+```bash
+export MEMORYLOOM_ENVIRONMENT=production
+export MEMORYLOOM_AUTH_MODE=jwt
+export MEMORYLOOM_AUTH_JWT_ISSUER='https://identity.example'
+export MEMORYLOOM_AUTH_JWT_AUDIENCE='memoryloom-api'
+export MEMORYLOOM_AUTH_JWT_JWKS_URL='https://identity.example/.well-known/jwks.json'
+export MEMORYLOOM_AUTH_JWT_ALGORITHMS='RS256'
+export MEMORYLOOM_AUTH_REQUIRED_SCOPE='memory'
+export MEMORYLOOM_AUTH_AUDIT_HMAC_KEY='load-this-from-a-secret-manager'
+export MEMORYLOOM_AUTH_AUDIT_SINK=postgres
+export MEMORYLOOM_GOVERNANCE_MODE=postgres
+export MEMORYLOOM_GOVERNANCE_HMAC_KEY='load-a-separate-secret-from-a-secret-manager'
+export MEMORYLOOM_GOVERNANCE_PSEUDONYM_KEY_ID='governance-2026-01'
+export MEMORYLOOM_PRIVACY_POLICY_VERSION='privacy-2026-01'
+```
+
+不要把审计 HMAC 密钥写入镜像、Compose 文件或 Git。JWT `memory_access` grant、角色、purpose、
+错误语义见[身份与权限设计](authorization.md)，处理依据/删除流程见[治理运行手册](governance.md)。
+这些服务能力不会自动提供 IdP 成员治理、token 撤销、浏览器登录、RLS、双人审批、保留扫描或备份到期。
+
+仓库提供 `compose.production.yaml` 作为单机 production pilot 的 fail-fast 覆盖层。它没有任何
+身份、数据库、对象存储或 HMAC Secret 默认值，并且强制 JWT、HTTPS issuer/JWKS、PostgreSQL
+授权审计、PostgreSQL 隐私治理与必需 Milvus 投影。先从 `.env.production.example` 建立由 Secret
+Manager 注入的环境，再仅做渲染检查：
+
+```bash
+docker compose --env-file .env.production \
+  -f compose.yaml -f compose.production.yaml config >/dev/null
+docker compose --env-file .env.production \
+  -f compose.yaml -f compose.production.yaml up -d --build
+```
+
+空值会在 Compose 插值阶段失败；伪造 HTTPS URL 只能通过格式检查，不能替代真实 IdP、TLS、
+撤销与 JWKS 轮换演练。启动后还必须为 probe subject 签发有效 ProcessingGrant，并由消费应用
+执行一次带短期 JWT 的实际 preference list/recall，不能只看 `/health`。
+
+## PostgreSQL 与迁移
+
+默认 Compose 使用开发专用凭据创建 PostgreSQL，并且不把 `5432` 发布到宿主机。`migrate` 服务通过项目入口执行 Schema 升级：
+
+```bash
+docker compose run --rm migrate
+```
+
+原生运行现有 PostgreSQL 时，先导出连接串，再使用同一入口：
+
+```bash
+export MEMORYLOOM_STORE=postgres
+export MEMORYLOOM_DATABASE_URL='postgresql://user:password@host:5432/database'
+uv run memoryloom-migrate
+uv run memoryloom
+```
+
+不要绕过项目入口直接调用裸 Alembic 命令；入口负责从统一运行时配置读取数据库 URL。
+
+进入生产前仍需继续验证：
+
+- 迁移升级/回滚、备份恢复和故障注入；
+- 数据库级 Scope、幂等、修订和归因约束的故障与并发验证；
+- Milvus outbox 消费、受控重放、投影恢复和生产连接池容量；
+- 隔离、并发冲突、数据库中断和重启恢复测试。
+
+进展顺序见 [路线图](../ROADMAP.md)。
+
+## 生产部署前必须完成
+
+当前版本缺少以下生产前置条件：
+
+1. PostgreSQL 迁移门禁、备份和恢复演练；
+2. IdP 角色治理、撤销/临时授权、增强认证、数据库 RLS 与审计访问治理；
+3. 处理依据审批、自动保留扫描、备份/导出副本删除和抽样核验；
+4. 生产 CORS、TLS、反向代理、秘密管理与网络策略；
+5. 持久审计、指标、追踪、告警和 SLO；
+6. 依赖、镜像和基础设施安全扫描。
+
+安全问题处理方式见 [安全政策](../SECURITY.md)。生产信任边界和隐私治理的目标验收标准见[威胁模型](threat-model.md)与[隐私生命周期设计](privacy-lifecycle.md)；这两项目前仍是设计，不是已交付能力。架构约束见[架构说明](architecture.md)与[开发指南](development.md)。
+
+## 常见问题
+
+### 端口已经被占用
+
+```bash
+ss -ltnp '( sport = :33009 or sport = :38089 )'
+docker compose ps
+```
+
+停止旧的本机进程或 Compose 项目后重试。修改后端浏览器可达地址时，为前后端进程设置相同的 `MEMORYLOOM_PUBLIC_API_URL`；修改前端 Origin 时同时更新后端 `MEMORYLOOM_CORS_ORIGINS`。
+
+### 容器健康检查失败
+
+```bash
+docker compose logs backend
+docker compose logs frontend
+docker compose logs postgres migrate
+docker compose config
+```
+
+首先确认镜像构建成功、两个端口未占用，并检查后端是否因非法环境变量退出。更多场景见 [故障排查](troubleshooting.md)。
