@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.11.16"
+
+jobs:
+  quality:
+    name: Quality checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+  evaluation-smoke:
+    name: Built-in memory evaluation (${{ matrix.dataset }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [smoke-v1, temporal-v1]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Run deterministic memory quality gates
+        run: >-
+          uv run memoryloom-eval run
+          --dataset builtin:${{ matrix.dataset }}
+          --format json
+          --report artifacts/memory-evaluation-${{ matrix.dataset }}.json
+
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-evaluation-report-${{ matrix.dataset }}
+          path: artifacts/memory-evaluation-${{ matrix.dataset }}.json
+          if-no-files-found: error
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    env:
+      MEMORYLOOM_TEST_DATABASE_URL: postgresql://memoryloom:memoryloom-local-only@127.0.0.1:5432/memoryloom_test
+      MEMORYLOOM_ALLOW_DESTRUCTIVE_TEST_DATABASE: "1"
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: memoryloom_test
+          POSTGRES_USER: memoryloom
+          POSTGRES_PASSWORD: memoryloom-local-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U memoryloom -d memoryloom_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Run tests and coverage gate
+        run: uv run pytest
+
+      - name: Enforce PostgreSQL adapter branch coverage
+        if: matrix.python-version == '3.12'
+        run: |
+          COVERAGE_FILE=/tmp/postgres.coverage uv run coverage run \
+            --rcfile=/dev/null \
+            --branch \
+            --source=src/memoryloom/adapters \
+            -m pytest tests/test_postgres_integration.py --no-cov -q
+          COVERAGE_FILE=/tmp/postgres.coverage uv run coverage report \
+            --rcfile=/dev/null \
+            --include='*/postgres.py' \
+            --fail-under=80
+
+  browser-e2e:
+    name: Frontend E2E (Chromium, ${{ matrix.store }})
+    runs-on: ubuntu-latest
+    env:
+      MEMORYLOOM_REQUIRE_BROWSER_E2E: "1"
+      MEMORYLOOM_REQUIRE_ACCESSIBILITY_E2E: "1"
+      MEMORYLOOM_BROWSER_E2E_STORE: ${{ matrix.store }}
+      MEMORYLOOM_TEST_DATABASE_URL: postgresql://memoryloom:memoryloom-local-only@127.0.0.1:5432/memoryloom_test
+      MEMORYLOOM_ALLOW_DESTRUCTIVE_TEST_DATABASE: "1"
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: memoryloom_test
+          POSTGRES_USER: memoryloom
+          POSTGRES_PASSWORD: memoryloom-local-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U memoryloom -d memoryloom_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 15
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [memory, postgres]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js for accessibility audit
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Install locked accessibility audit dependency
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install Chromium
+        # The GitHub image already ships the shared libraries Chromium needs;
+        # skipping --with-deps avoids a fragile apt mirror during CI.
+        run: uv run playwright install chromium
+
+      - name: Run browser E2E tests
+        run: uv run pytest tests/test_frontend_e2e.py --no-cov -q
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Verify evaluation resources from the wheel
+        run: |
+          uv venv /tmp/memoryloom-wheel
+          uv pip install --python /tmp/memoryloom-wheel/bin/python --no-deps dist/*.whl
+          /tmp/memoryloom-wheel/bin/memoryloom-eval validate --dataset builtin:smoke-v1
+          /tmp/memoryloom-wheel/bin/memoryloom-eval run --dataset builtin:smoke-v1
+          /tmp/memoryloom-wheel/bin/memoryloom-eval validate --dataset builtin:temporal-v1
+          /tmp/memoryloom-wheel/bin/memoryloom-eval run --dataset builtin:temporal-v1
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+
+  container:
+    name: Container configuration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Compose files
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.memory.yaml config --quiet
+
+      - name: Build application image
+        run: docker build --tag memoryloom:ci .
